@@ -39,6 +39,9 @@ retrieve.functions <- function(uris, extensions) {
   functions
 }
 
+## Functions that convert Substrait nodes ("messages") to SQL
+## Name of list element is the message "type" that it expects as its argument
+
 sql.emitters <- list(
   substrait.Expression = function(x) {
     if (x$has("selection")) {

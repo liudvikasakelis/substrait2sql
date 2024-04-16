@@ -13,3 +13,11 @@ Is [https://substrait.io/](this). TL;DR it's kinda SQL, but not human-readable. 
 	* Test cases = Ibis queries. To get reference output, they are executed (by Ibis) against test SQLite database, and return a table. Test outputs are computed by running Ibis Substrait compiler on the queries, compiling substrait to SQL using this compiler, running that SQL directly on SQLite database. Both outputs expected to be equal. 
 	  I'm using Ibis substrait compiler because it's the best to my knowledge (I had apparent errors with Substrait-R). Testing only a single implementation, and only one SQL dialect leaves more to be desired, but it's really appropriate for the state of the compiler. 
   
+## How to run tests
+
+```
+source venv/bin/activate 
+python tests/test_name.py
+```
+
+Help porting to a more complete testing framework would be much appreciated. 
