@@ -1,4 +1,4 @@
-import ibis 
+import ibis
 from ibis import _
 import subprocess
 from ibis_substrait.compiler.core import SubstraitCompiler
@@ -14,7 +14,6 @@ def equal_datasets(t1, t2):
         (t1.count().execute() == t2.count().execute()) &
         (t1.join(t2, t1.columns).count().execute() == t1.count().execute())
     )
-
 
 def run_test(transformation, *tables):
     reference_result = transformation(*tables)

@@ -1,9 +1,10 @@
-library(RProtoBuf)
+library("stringr")
+library("RProtoBuf")
 
 ## Utility functions
 
 AS <- function(inp, out) {
-  paste(inp, "AS", out) |> 
+  paste(inp, "AS", out) |>
     paste(collapse=", ")
 }
 
@@ -11,12 +12,65 @@ id.to.colname <- function(x) {
   paste("_c_", x, sep="")
 }
 
+rename <- function(n, renames) {
+  ## Apply renames of the form `c(old_name = "new_name")`
+  c(
+    renames[intersect(n, names(renames))],
+    setdiff(n, names(renames))
+  )
+}
+
+return.first.match <- function(message, field.list) {
+  for (field in field.list) {
+    if (message$has(field)) {return(message[[field]])}
+  }
+}
+
+get.output.names <- function(message) {
+  if (message@type == "substrait.NamedStruct") {
+    message$names
+  } else if (message@type == "substrait.ReadRel") {
+    if (message$has("projection")) {
+      ## TODO
+      ## What is projection ;(
+    } else {
+      get.output.names(message$base_schema)
+    }
+  } else if (message@type == "substrait.ProjectRel") {
+    message$common$emit$output_mapping %>% id.to.colname
+  } else if (message@type == "substrait.FilterRel") {
+    ## FIXME
+    0:(length(get.output.names(message$input))-1) %>% id.to.colname
+  } else if (message@type == "substrait.RelRoot") {
+    message$names
+  } else if (message@type == "substrait.Rel") {
+    return.first.match(
+      message,
+      c("read", "filter", "project")
+    ) %>% get.output.names
+  } else {
+    stop(message@type, " not defined")
+  }
+}
+
 retrieve.functions <- function(uris, extensions) {
   ## Creates a named list of all external functions defined in Plan
-  ## so they can be accessed by their names (which are numerical indices):
+  ## so they can be accessed by their numerical indices ("anchors"):
   ## function.list[["2"]](1, 2) => "1 + 2"
-  
-  infix.functions <- c("+", "-", "/", "*")
+
+  function.aliases <- c(
+    "lt" = "<",
+    "gt" = ">"
+  )
+
+  infix.functions <- c(
+    "<",
+    ">",
+    "+",
+    "-",
+    "/",
+    "*"
+  )
 
   prefix.builder <- function(fname) {
     function(...) {
@@ -28,13 +82,19 @@ retrieve.functions <- function(uris, extensions) {
       paste("(", a, fname, b, ")")
     }
   }
-    
-  function.names <- lapply(extensions, function(x) {x$extension_function$name})
+
+  function.names <- sapply(extensions, function(x) {x$extension_function$name}) |>
+    str_split_i(":", 1) |>   # Removes everyting after first `:`
+    rename(function.aliases)
+
   function.anchors <- sapply(extensions, function(x) {x$extension_function$function_anchor})
 
   functions <- function.names |>
-    lapply(function(x) {if (x %in% infix.functions) infix.builder(x) else prefix.builder(x)})
-    
+    lapply(function(x) {if (x %in% infix.functions)
+                          infix.builder(x)
+                        else
+                          prefix.builder(x)})
+
   names(functions) <- as.character(function.anchors)
   functions
 }
@@ -59,11 +119,14 @@ sql.emitters <- list(
   },
 
   substrait.Expression.Literal = function(x) {
-    x$fp64 # FIXME
+    numeric_types <- c("i8", "i16", "i32", "i64", "fp32", "fp64")
+    for (field in numeric_types) {
+      if (x$has(field)) {return(x[[field]])}
+    }
   },
 
   substrait.Expression.ScalarFunction = function(x) {
-    ## function.call <- parsed.from.raw$relations[[1]]$root$input$project$input$project$expressions[[12]]$scalar_function 
+    ## function.call <- parsed.from.raw$relations[[1]]$root$input$project$input$project$expressions[[12]]$scalar_function
     f <- dynGet("plan.functions")[[as.character(x$function_reference)]]
     args <- lapply(x$arguments, message2sql)
     do.call(f, args)
@@ -73,9 +136,21 @@ sql.emitters <- list(
     message2sql(x$value)
   },
 
+  substrait.FilterRel =  function(x) {
+    paste0(
+      "SELECT * FROM (",
+      message2sql(x$input),
+      ") WHERE (",
+      message2sql(x$condition),
+      ")"
+    )
+  },
+
   substrait.NamedStruct = function(x) {
-    indices <- seq(from=0, length.out=length(x$names)) |> id.to.colname()
-    x$names |> AS(indices)
+    get.output.names(x) |>
+      paste(collapse=", ")
+    ## indices <- seq(from=0, length.out=length(x$names)) |> id.to.colname()
+    ## x$names |> AS(indices)
   },
 
   substrait.Plan =  function(x) {
@@ -101,9 +176,12 @@ sql.emitters <- list(
   },
 
   substrait.ReadRel = function(x) {
+    ## FIXME: needs aliases
+    inputs <- get.output.names(x$base_schema)
+    outputs <- 0:(length(inputs)-1) %>% id.to.colname
     paste(
       "SELECT",
-      message2sql(x$base_schema),
+      inputs %>% AS(outputs),
       "FROM",
       message2sql(x$named_table)
     )
@@ -111,31 +189,32 @@ sql.emitters <- list(
 
   substrait.ReadRel.NamedTable =  function(x) {
     as.character(x$names[1L])
-  }, 
+  },
 
   substrait.Rel = function(x) {
     if (x$has("read")) {
       message2sql(x$read)
     } else if (x$has("project")) {
       message2sql(x$project)
+    } else if (x$has("filter")) {
+      message2sql(x$filter)
     }
   },
 
   substrait.RelRoot = function(x) {
-    inputs <- x$input$project$common$emit$output_mapping # FIXME
-    outputs <- x$names
-    if (is.numeric(outputs)) {
-      outputs <- id.to.colname(outputs)
-    } 
-    columns.to.aliases <- id.to.colname(inputs) |> AS(outputs)
+    ## This is one of not many functions that has output with named columns
+
+    input.names <- get.output.names(x$input)
+    outputs <- get.output.names(x)
+
     paste(
       "SELECT",
-      columns.to.aliases,
+      input.names |> AS(outputs),
       "FROM",
       "(",
       message2sql(x$input),
       ")"
-    )  
+    )
   }
 
 )
