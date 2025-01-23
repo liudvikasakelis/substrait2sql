@@ -4,7 +4,7 @@ This package is an exploration into translating Substrait to (some) SQL. Such a 
 
 ## What Substrait is
 
-Is [https://substrait.io/](this). TL;DR it's kinda SQL, but not human-readable. There are several packages that generate it, but not very many consumers (DuckDB is perhaps the most famous native substrait consumer).
+Is [this](https://substrait.io/). TL;DR it's kinda SQL, but not human-readable. There are several packages that generate it, but not very many consumers (DuckDB is perhaps the most famous native substrait consumer).
 
 ## What works
   * **Very** limited subset of SQL
