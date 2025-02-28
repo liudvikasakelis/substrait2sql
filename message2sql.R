@@ -60,10 +60,12 @@ retrieve.functions <- function(uris, extensions) {
 
   function.aliases <- c(
     "lt" = "<",
-    "gt" = ">"
+    "gt" = ">",
+    "equal" = "="
   )
 
   infix.functions <- c(
+    "=",
     "<",
     ">",
     "+",
@@ -218,6 +220,34 @@ sql.emitters <- list(
   }
 
 )
+
+sql.emitters$substrait.JoinRel <- function(x) {
+  ## TODO unfinished work
+  ## type 0 = unspecified
+  ## Current issue: field indices chosen independently for left + right tables,
+  ## so they are not unique over whole thing
+  join.types <- c("INNER", "OUTER", "LEFT", "RIGHT", "SEMI", "ANTI", "SINGLE")
+  left.outputs <- 0:(length(get.output.names(x$left))-1) %>% id.to.colname
+  right.outputs <- 0:(length(get.output.names(x$right))-1) %>% id.to.colname
+  paste(
+    "SELECT",
+    paste0("LHS.", left.outputs) |> paste(collapse=", "),
+    ",",
+    paste0("RHS.", right.outputs) |> AS(id.to.colname(seq(length(left.outputs), length.out=length(right.outputs)))),
+    "FROM",
+    "(",
+    message2sql(x$left),
+    ") AS LHS",
+    join.types[x$type],
+    "JOIN",
+    "(",
+    message2sql(x$right),
+    ") AS RHS",
+    "ON",
+    message2sql(x$expression)
+  )
+}
+
 
 readProtoFiles2(dir = "substrait",
                 protoPath = "~/p/substrait-io/substrait/proto")
