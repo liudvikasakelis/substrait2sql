@@ -1,4 +1,4 @@
-import ibis 
+import ibis
 from ibis import _
 
 from common import run_test, sqlite_con

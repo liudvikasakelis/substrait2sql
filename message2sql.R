@@ -1,6 +1,14 @@
 library("stringr")
 library("RProtoBuf")
 
+##
+
+partial.translate <- function(full.plan, segment) {
+  ## For debugging use, to evaluate a small part of plan
+  plan.functions <- retrieve.functions(full.plan$extension_uris, full.plan$extensions)
+  substrait2sql.list(segment)
+}
+
 ## Utility functions
 
 AS <- function(inp, out) {
@@ -20,36 +28,61 @@ rename <- function(n, renames) {
   )
 }
 
-return.first.match <- function(message, field.list) {
+return.first.match <- function(S, field.list) {
   for (field in field.list) {
-    if (message$has(field)) {return(message[[field]])}
+    if (field %in% names(S)) {return(S[[field]])}
+  }
+}
+
+tree.walker <- function(tree, target.node.id, f) {
+  ## Returns a @tree where nodes with $.type matching @target.node.id get function
+  ## @f applied to them.
+  ## In the cases where target type node has children of same type, children will not be
+  ## considered by tree.walker. In such cases incorporate tree.walker into @f
+  if (is.list(tree)) {
+    if (".type" %in% names(tree) && tree$.type == target.node.id) {
+      f(tree)
+    } else { ## Tree nodes that aren't targeted, but perhaps their children are
+      lapply(tree, tree.walker, target.node.id=target.node.id, f=f)
+    }
+  } else { ## Things that aren't lists are always leaves and are returned as-is
+    tree
   }
 }
 
 get.output.names <- function(message) {
-  if (message@type == "substrait.NamedStruct") {
+  ## if (is.null(message$.type)) {
+  ##   print('x')
+  ##   print(message)
+  ## }
+  if (message$.type == "substrait.NamedStruct") {
     message$names
-  } else if (message@type == "substrait.ReadRel") {
-    if (message$has("projection")) {
+  } else if (message$.type == "substrait.ReadRel") {
+    if ("projection" %in% names(message)) {
       ## TODO
       ## What is projection ;(
     } else {
       get.output.names(message$base_schema)
     }
-  } else if (message@type == "substrait.ProjectRel") {
-    message$common$emit$output_mapping %>% id.to.colname
-  } else if (message@type == "substrait.FilterRel") {
+  } else if (message$.type == "substrait.ProjectRel") {
+    message$common$emit$output_mapping |> id.to.colname()
+  } else if (message$.type == "substrait.FilterRel") {
     ## FIXME
-    0:(length(get.output.names(message$input))-1) %>% id.to.colname
-  } else if (message@type == "substrait.RelRoot") {
+    0:(length(get.output.names(message$input))-1) |> id.to.colname()
+  } else if (message$.type == "substrait.RelRoot") {
     message$names
-  } else if (message@type == "substrait.Rel") {
+  } else if (message$.type == "substrait.Rel") {
     return.first.match(
       message,
-      c("read", "filter", "project")
-    ) %>% get.output.names
+      c("read", "filter", "project", "join")
+    ) |> get.output.names()
+  } else if (message$.type == "substrait.JoinRel") {
+    ## FIXME
+    0:(length(get.output.names(message$left)) +
+         length(get.output.names(message$right)) -
+         1) |> id.to.colname()
   } else {
-    stop(message@type, " not defined")
+    stop(message$.type, " not defined")
   }
 }
 
@@ -105,13 +138,17 @@ retrieve.functions <- function(uris, extensions) {
 ## Name of list element is the message "type" that it expects as its argument
 
 sql.emitters <- list(
+  custom.fieldByName = function(x) {
+    x$fullname
+  },
+
   substrait.Expression = function(x) {
-    if (x$has("selection")) {
-      message2sql(x$selection)
-    } else if (x$has("scalar_function")) {
-      message2sql(x$scalar_function)
-    } else if (x$has("literal")) {
-      message2sql(x$literal)
+    if ("selection" %in% names(x)) {
+      substrait2sql.list(x$selection)
+    } else if ("scalar_function" %in% names(x)) {
+      substrait2sql.list(x$scalar_function)
+    } else if ("literal" %in% names(x)) {
+      substrait2sql.list(x$literal)
     }
   },
 
@@ -123,28 +160,64 @@ sql.emitters <- list(
   substrait.Expression.Literal = function(x) {
     numeric_types <- c("i8", "i16", "i32", "i64", "fp32", "fp64")
     for (field in numeric_types) {
-      if (x$has(field)) {return(x[[field]])}
+      if (field %in% names(x)) {return(x[[field]])}
     }
   },
 
   substrait.Expression.ScalarFunction = function(x) {
-    ## function.call <- parsed.from.raw$relations[[1]]$root$input$project$input$project$expressions[[12]]$scalar_function
     f <- dynGet("plan.functions")[[as.character(x$function_reference)]]
-    args <- lapply(x$arguments, message2sql)
+    args <- lapply(x$arguments, substrait2sql.list)
     do.call(f, args)
   },
 
   substrait.FunctionArgument =  function(x) {
-    message2sql(x$value)
+    substrait2sql.list(x$value)
   },
 
   substrait.FilterRel =  function(x) {
     paste0(
       "SELECT * FROM (",
-      message2sql(x$input),
+      substrait2sql.list(x$input),
       ") WHERE (",
-      message2sql(x$condition),
+      substrait2sql.list(x$condition),
       ")"
+    )
+  },
+
+  substrait.JoinRel = function(x) {
+    ## type 0 = unspecifiedc
+    join.types <- c("INNER", "OUTER", "LEFT", "RIGHT", "SEMI", "ANTI", "SINGLE")
+
+    left.inputs <- seq(0, along.with=get.output.names(x$left)) |> id.to.colname()
+    right.inputs <- seq(0, along.with=get.output.names(x$right)) |> id.to.colname()
+    combined.inputs <- data.frame(
+      old.name = c(paste0("LHS.", left.inputs),
+                   paste0("RHS.", right.inputs)),
+      new.index = seq(0, along.with=c(left.inputs, right.inputs))
+    )
+
+    expression <- tree.walker(x$expression, "substrait.Expression.FieldReference", function(elem) {
+      index <- elem$direct_reference$struct_field$field
+      list(
+        .type = "custom.fieldByName",
+        fullname = combined.inputs$old.name[combined.inputs$new.index==index]
+      )
+    })
+
+    paste(
+      "SELECT",
+      combined.inputs$old.name |> AS(combined.inputs$new.index |> id.to.colname()),
+      "FROM",
+      "(",
+      substrait2sql.list(x$left),
+      ") AS LHS",
+      join.types[x$type],
+      "JOIN",
+      "(",
+      substrait2sql.list(x$right),
+      ") AS RHS",
+      "ON",
+      substrait2sql.list(expression)
     )
   },
 
@@ -157,13 +230,13 @@ sql.emitters <- list(
 
   substrait.Plan =  function(x) {
     plan.functions <- retrieve.functions(x$extension_uris, x$extensions)
-    message2sql(x$relations[[1]]$root)
+    substrait2sql.list(x$relations[[1]]$root)
   },
 
   substrait.ProjectRel =  function(x) {
     inputs <- lapply(
       x$expressions,
-      message2sql
+      substrait2sql.list
     ) |> unlist()
     outputs <- x$common$emit$output_mapping |> id.to.colname()
     columns.to.aliases <- inputs |> AS(outputs)
@@ -172,7 +245,7 @@ sql.emitters <- list(
       columns.to.aliases,
       "\nFROM\n",
       "(",
-      message2sql(x$input),
+      substrait2sql.list(x$input),
       ")"
     )
   },
@@ -185,7 +258,7 @@ sql.emitters <- list(
       "SELECT",
       inputs %>% AS(outputs),
       "FROM",
-      message2sql(x$named_table)
+      substrait2sql.list(x$named_table)
     )
   },
 
@@ -194,12 +267,14 @@ sql.emitters <- list(
   },
 
   substrait.Rel = function(x) {
-    if (x$has("read")) {
-      message2sql(x$read)
-    } else if (x$has("project")) {
-      message2sql(x$project)
-    } else if (x$has("filter")) {
-      message2sql(x$filter)
+    if ("read" %in% names(x)) {
+      substrait2sql.list(x$read)
+    } else if ("project" %in% names(x)) {
+      substrait2sql.list(x$project)
+    } else if ("filter" %in% names(x)) {
+      substrait2sql.list(x$filter)
+    } else if ("join" %in% names(x)) {
+      substrait2sql.list(x$join)
     }
   },
 
@@ -214,52 +289,46 @@ sql.emitters <- list(
       input.names |> AS(outputs),
       "FROM",
       "(",
-      message2sql(x$input),
+      substrait2sql.list(x$input),
       ")"
     )
   }
-
 )
-
-sql.emitters$substrait.JoinRel <- function(x) {
-  ## TODO unfinished work
-  ## type 0 = unspecified
-  ## Current issue: field indices chosen independently for left + right tables,
-  ## so they are not unique over whole thing
-  join.types <- c("INNER", "OUTER", "LEFT", "RIGHT", "SEMI", "ANTI", "SINGLE")
-  left.outputs <- 0:(length(get.output.names(x$left))-1) %>% id.to.colname
-  right.outputs <- 0:(length(get.output.names(x$right))-1) %>% id.to.colname
-  paste(
-    "SELECT",
-    paste0("LHS.", left.outputs) |> paste(collapse=", "),
-    ",",
-    paste0("RHS.", right.outputs) |> AS(id.to.colname(seq(length(left.outputs), length.out=length(right.outputs)))),
-    "FROM",
-    "(",
-    message2sql(x$left),
-    ") AS LHS",
-    join.types[x$type],
-    "JOIN",
-    "(",
-    message2sql(x$right),
-    ") AS RHS",
-    "ON",
-    message2sql(x$expression)
-  )
-}
 
 
 readProtoFiles2(dir = "substrait",
                 protoPath = "~/p/substrait-io/substrait/proto")
 
-message2sql <- function(message) {
-  stopifnot(inherits(message, "Message"))
-  stopifnot(message@type %in% names(sql.emitters))
 
-  emitter <- sql.emitters[[message@type]]
-  emitter(message)
+substrait2sql.list <- function(l) {
+  stopifnot(l$.type %in% names(sql.emitters))
+  emitter <- sql.emitters[[l$.type]]
+  emitter(l)
 }
 
+substrait2sql.Message <- function(message) {
+  stopifnot(inherits(message, "Message"))
+  message |> Message2list() |> substrait2sql.list()
+}
+
+Message2list <- function(x) {
+  if(inherits(x, "Message")) {
+    l <- x |> as.list()
+    ## I have a suspicion that only the second filter is necessary
+    l <- l[union(
+      Filter(x$has, names(l)),
+      Filter(function(x) {!inherits(l[[x]], "Message")}, names(l))
+    )]
+    l$.type <- x@type
+    l |> Message2list()
+  } else if (is.list(x)) {
+    lapply(x, Message2list)
+  } else {
+    x
+  }
+}
+
+
 buffer2sql <- function(buffer) {
-  RProtoBuf::read(substrait.Plan, buffer) |> message2sql()
+  RProtoBuf::read(substrait.Plan, buffer) |> substrait2sql.Message()
 }
